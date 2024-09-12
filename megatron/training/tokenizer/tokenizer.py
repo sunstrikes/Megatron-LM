@@ -2,8 +2,12 @@
 
 """Megatron tokenizers."""
 
-from abc import ABC
-from abc import abstractmethod
+import math
+from abc import ABC, abstractmethod
+import base64
+import json
+from pathlib import Path
+from typing import Dict, List, Optional
 
 import types
 
@@ -13,7 +17,7 @@ from .bert_tokenization import FullTokenizer as FullBertTokenizer
 from .gpt2_tokenization import GPT2Tokenizer
 
 
-def build_tokenizer(args):
+def build_tokenizer(args, **kwargs):
     """Initialize tokenizer."""
     if args.rank == 0:
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
@@ -41,18 +45,22 @@ def build_tokenizer(args):
         assert args.tokenizer_model is not None
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
     elif args.tokenizer_type == 'HuggingFaceTokenizer':
-        tokenizer = _HuggingFaceTokenizer(args.tokenizer_model)
+        tokenizer = _HuggingFaceTokenizer(args.tokenizer_model, **kwargs)
     elif args.tokenizer_type == 'Llama2Tokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _Llama2Tokenizer(args.tokenizer_model)
-    elif args.tokenizer_type == 'Llama3Tokenizer':
+    elif args.tokenizer_type == 'TikTokenizer':
         assert args.tokenizer_model is not None
-        tokenizer = create_llama3_tokenizer(args.tokenizer_model)
-    elif args.tokenizer_type == 'MistralTokenizer':
-        assert args.tokenizer_model is not None
-        tokenizer = create_mistral_tokenizer(args.tokenizer_model)
-        tokenizer.vocab_size = 32768
-        tokenizer.eos_id = tokenizer.instruct_tokenizer.tokenizer.eos_id
+        assert args.tiktoken_pattern is not None
+        assert args.tiktoken_pattern in {"v1", "v2"}
+        pattern = PATTERN_TIKTOKEN if args.tiktoken_pattern == "v1" else PATTERN_TIKTOKEN_V2
+        tokenizer = CustomTikTokenizer(
+            path=args.tokenizer_model,
+            pattern=pattern,
+            vocab_size=args.vocab_size,
+            num_special_tokens=args.tiktoken_num_special_tokens,
+            special_tokens=args.tiktoken_special_tokens,
+        )
     elif args.tokenizer_type == 'NullTokenizer':
         assert args.vocab_size is not None
         tokenizer = _NullTokenizer(args.vocab_size)
@@ -68,16 +76,15 @@ def build_tokenizer(args):
     return tokenizer
 
 
-def _vocab_size_with_padding(orig_vocab_size, args):
+def _vocab_size_with_padding(orig_vocab_size, args, logging_enabled=True):
     """Pad vocab size so it is divisible by model parallel size and
     still having GPU friendly size."""
 
     after = orig_vocab_size
     multiple = args.make_vocab_size_divisible_by * \
         args.tensor_model_parallel_size
-    while (after % multiple) != 0:
-        after += 1
-    if args.rank == 0:
+    after = int(math.ceil(after / multiple) * multiple)
+    if args.rank == 0 and logging_enabled:
         print(' > padded vocab (size: {}) with {} dummy tokens '
               '(new size: {})'.format(
                   orig_vocab_size, after - orig_vocab_size, after), flush=True)
@@ -85,15 +92,15 @@ def _vocab_size_with_padding(orig_vocab_size, args):
 
 
 class _HuggingFaceTokenizer(MegatronTokenizer):
-    def __init__(self, pretrained_model_name_or_path):
-        super().__init__(pretrained_model_name_or_path)
+    def __init__(self, pretrained_model_name_or_path, **kwargs):
+        super().__init__(pretrained_model_name_or_path, **kwargs)
         try:
             import transformers
         except ImportError:
             raise EnvironmentError(f"The transformers library must be installed to use huggingface_tokenizer_provider")
 
         # TODO(bnorick): download tokenizer once to lustre and use force offline to make sure all tasks read it from there
-        self._tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path)
+        self._tokenizer = transformers.AutoTokenizer.from_pretrained(pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs)
         self._vocab = self._tokenizer.get_vocab()
         self._inv_vocab = {token_id: token for token, token_id in self._vocab.items()}
 
@@ -115,11 +122,11 @@ class _HuggingFaceTokenizer(MegatronTokenizer):
     def decoder(self):
         return self._inv_vocab
 
-    def tokenize(self, text):
-        return self._tokenizer(text).input_ids
+    def tokenize(self, text, **kwargs):
+        return self._tokenizer(text, **kwargs).input_ids
 
-    def detokenize(self, token_ids):
-        return self._tokenizer.decode(token_ids)
+    def detokenize(self, token_ids, **kwargs):
+        return self._tokenizer.decode(token_ids, **kwargs)
 
     @property
     def eod(self):
@@ -542,109 +549,155 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
         return None
 
 
-def create_llama3_tokenizer(*args, **kwargs):
+def reload_mergeable_ranks(
+    path: str,
+    max_vocab: Optional[int] = None,
+) -> Dict[bytes, int]:
+    """
+    Reload our tokenizer JSON file and convert it to Tiktoken format.
+    """
+    from ..utils import print_rank_0  # To prevent circular import.
 
-    try:
-        from llama.tokenizer import Tokenizer as Llama3Tokenizer
-    except ImportError:
-        raise ImportError("Module 'llama' is required but not installed.")
+    assert path.endswith(".json")
 
-    class _Llama3Tokenizer(Llama3Tokenizer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
+    # reload vocab
+    with open(path, "r") as f:
+        vocab = json.load(f)
+    assert isinstance(vocab, list)
+    print_rank_0(f"Vocab size: {len(vocab)}")
+    if max_vocab is not None:
+        vocab = vocab[:max_vocab]
+        print_rank_0(f"Cutting vocab to first {len(vocab)} tokens.")
 
-        def instruct_tokenize(self, s: str, bos=True, eos=False):
-            '''Default args for text completion, not chat/dialog.'''
+    # build ranks
+    ranks: Dict[bytes, int] = {}
+    for i, x in enumerate(vocab):
+        assert x.keys() == {"rank", "token_bytes", "token_str"}
+        assert x["rank"] == i
+        merge = base64.b64decode(x["token_bytes"])
+        assert i >= 256 or merge == bytes([i])
+        ranks[merge] = x["rank"]
 
-            assert type(s) is str
+    # sanity check
+    assert len(ranks) == len(vocab)
+    assert set(ranks.values()) == set(range(len(ranks)))
 
-            t = self.encode(s, bos=bos, eos=eos, allowed_special='all')
-            return t
-
-        def tokenize(self, s: str, bos=True, eos=False):
-            '''Default args for text completion, not chat/dialog.'''
-
-            assert type(s) is str
-
-            t = self.encode(s, bos=bos, eos=eos, allowed_special='all')
-            return t
-
-        def detokenize(self, ids):
-            return self.decode(ids)
-
-        @property
-        def cls(self):
-            return -1
-
-        @property
-        def sep(self):
-            return -1
-
-        @property
-        def mask(self):
-            return -1
-
-        @property
-        def eod(self):
-            return self.eos_id
-
-        @property
-        def additional_special_tokens_ids(self):
-            return None
-
-        @property
-        def vocab_size(self):
-            return self.model.n_vocab
-
-    return _Llama3Tokenizer(*args, **kwargs)
+    return ranks
 
 
-def create_mistral_tokenizer(*args, **kwargs):
-    try:
-        from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
-        from mistral_common.tokens.instruct.request import InstructRequest
-        from mistral_common.protocol.instruct.messages import UserMessage
-    except ImportError:
-        raise ImportError("Module 'mistral-common' is required but not installed.")
+PATTERN_TIKTOKEN = r"[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"
+PATTERN_TIKTOKEN_V2 = "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"
 
-    class _MistralTokenizer(MistralTokenizer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
+class CustomTikTokenizer(MegatronTokenizer):
+    def __init__(
+        self,
+        path: str,
+        pattern: str,
+        vocab_size: Optional[int],
+        num_special_tokens: int,
+        special_tokens: Optional[List[str]],
+    ):
+        super().__init__(
+            path,
+            pattern=pattern,
+            vocab_size=vocab_size,
+            num_special_tokens=num_special_tokens,
+            special_tokens=special_tokens
+        )
+        import tiktoken
+        from .. import print_rank_0  # To prevent circular import.
 
-    tokenizer = _MistralTokenizer.from_file(*args, **kwargs)
+        if vocab_size is None:
+            vocab_size = 2**17  # Fallback vocab size is 131072.
+        self._vocab_size = vocab_size
 
-    def tokenize(self, s: str, bos=True, eos=False):
-        '''Default args for text completion, not chat/dialog.'''
+        SPECIAL_TOKENS = ["<unk>", "<s>", "</s>"]
+        if special_tokens is None:
+            special_tokens = SPECIAL_TOKENS.copy()
+        assert len(special_tokens) == len(set(special_tokens)), f"Special tokens should be unique: {special_tokens}"
+        assert len(special_tokens) <= num_special_tokens < self._vocab_size
+        assert set(SPECIAL_TOKENS) <= set(special_tokens), f"Custom special tokens should include {SPECIAL_TOKENS}"
 
-        assert type(s) is str
+        special_filler = ["<SPECIAL_{id}>".format(id=i) for i in range(len(special_tokens), num_special_tokens)]
+        if special_filler:
+            print_rank_0(f"Adding special tokens {special_filler[0]}, ..., {special_filler[-1]}")
+        special_tokens = special_tokens + special_filler
+        assert len(set(special_tokens)) == len(special_tokens) == num_special_tokens, special_tokens
+        inner_vocab_size = self._vocab_size - num_special_tokens
 
-        t = self.instruct_tokenizer.tokenizer.encode(s, bos=bos, eos=eos)
+        token_to_id_without_special_tokens = reload_mergeable_ranks(path, max_vocab=inner_vocab_size)
+        # Create space for special tokens.
+        token_to_id_without_special_tokens = {t: i + num_special_tokens for t, i in token_to_id_without_special_tokens.items()}
 
-        return t
+        special_tokens = {t: i for i, t in enumerate(special_tokens)}
+        self._unk_id = special_tokens["<unk>"]
+        self._bos_id = special_tokens["<s>"]
+        self._eos_id = special_tokens["</s>"]
 
-    def instruct_tokenize(self, s: str):
-        '''Default args for text completion, not chat/dialog.'''
-
-        assert type(s) is str
-
-        t = self.instruct_tokenizer.encode_instruct(
-            InstructRequest(
-                messages=[
-                    UserMessage(content=s),
-                ],
-            )
+        # Create tiktoken model.
+        self._model = tiktoken.Encoding(
+            name=Path(path).parent.name,
+            pat_str=pattern,
+            mergeable_ranks=token_to_id_without_special_tokens,
+            special_tokens=special_tokens,
         )
 
-        return t.tokens[1:] # strip of box
+        # Create final _id_to_token and _token_to_id data structures with special tokens inserted
+        # into appropriate locations.
+        assert set(token_to_id_without_special_tokens.keys()).isdisjoint(set(special_tokens.keys()))
+        self._token_to_id = token_to_id_without_special_tokens.copy()
+        self._token_to_id.update(special_tokens)
+        self._id_to_token = {v: k for k, v in self._token_to_id.items()}
+        assert set(range(self._vocab_size)) == set(self._id_to_token.keys())
 
-    def detokenize(self, ids):
-        return self.instruct_tokenizer.tokenizer.decode(ids)
 
-    tokenizer.tokenize = types.MethodType(tokenize, tokenizer)
-    tokenizer.detokenize = types.MethodType(detokenize, tokenizer)
-    tokenizer.instruct_tokenize = types.MethodType(instruct_tokenize, tokenizer)
+    @property
+    def bos(self) -> int:
+        return self._bos_id
 
-    return tokenizer
+    @property
+    def eos(self) -> int:
+        return self._eos_id
+
+    @property
+    def unk(self) -> int:
+        return self._unk_id
+
+    @property
+    def eod(self) -> int:
+        return self._eos_id
+
+    @property
+    def vocab(self):
+        return self._token_to_id
+
+    @property
+    def inv_vocab(self):
+        return self._id_to_token
+
+    def tokenize(self, s: str, bos: bool = False, eos: bool = False) -> List[int]:
+        tokens = self._model.encode_ordinary(s)
+        if bos:
+            tokens = [self.bos, *tokens]
+        if eos:
+            tokens = [*tokens, self.eos]
+
+        return tokens
+
+    def detokenize(self, tokens: List[int]) -> str:
+        return self._model.decode(tokens)
+
+    @property
+    def vocab_size(self) -> int:
+        return self._vocab_size
+
+    @property
+    def encoder(self):
+        return self._token_to_id
+
+    @property
+    def decoder(self):
+        return self._id_to_token
 
 
 class _NullTokenizer(MegatronTokenizer):

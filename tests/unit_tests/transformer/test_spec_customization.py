@@ -9,16 +9,16 @@ import torch
 import transformer_engine as te
 from pkg_resources import packaging
 
-from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
-from megatron.core.transformer.custom_layers.transformer_engine import (
+from megatron.core.extensions.transformer_engine import (
     TEDotProductAttention,
     TELayerNormColumnParallelLinear,
     TENorm,
     TERowParallelLinear,
 )
+from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -55,7 +55,7 @@ class TestSpecCustomization:
 
         # specify layernorm spec with module path to test dynamic importing
         self.layernorm_spec = ModuleSpec(
-            module=("megatron.core.transformer.custom_layers.transformer_engine", "TENorm"),
+            module=("megatron.core.extensions.transformer_engine", "TENorm")
         )
 
         # specify bias dropout add with module path
@@ -97,7 +97,7 @@ class TestSpecCustomization:
         assert x == random_input
 
         # Check SelfAttention
-        self_attention = build_module(self.attention_spec, config=self.config, layer_number=1,)
+        self_attention = build_module(self.attention_spec, config=self.config, layer_number=1)
         assert isinstance(self_attention, SelfAttention)
         assert self_attention.layer_number == 1
         assert self_attention.attn_mask_type == self.attention_spec.params['attn_mask_type']
@@ -209,7 +209,8 @@ class TestSpecCustomization:
             layer_specs=[
                 ModuleSpec(module=TransformerLayer, submodules=layer_local_spec.submodules)
             ]
-            * transformer_config.num_layers
+            * transformer_config.num_layers,
+            layer_norm=TENorm,
         )
         # make sure the model init conditions are identical
         model_parallel_cuda_manual_seed(123)
