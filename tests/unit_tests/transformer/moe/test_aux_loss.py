@@ -4,7 +4,10 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
+from megatron.core.transformer.moe.moe_utils import (
+    clear_aux_losses_tracker,
+    get_moe_layer_wise_logging_tracker,
+)
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestContainer
 
@@ -12,7 +15,7 @@ from tests.unit_tests.transformer.moe.test_token_dispatcher import MoEModelTestC
 class AuxlossTestContainer(MoEModelTestContainer):
     def partition_input(self, input):
         partitioned_input = input.chunk(
-            parallel_state.get_tensor_and_context_parallel_world_size(), dim=1
+            parallel_state.get_tensor_and_context_parallel_world_size(), dim=0
         )[parallel_state.get_tensor_and_context_parallel_rank()]
         output = partitioned_input.clone().detach()
         output.requires_grad = True
@@ -28,8 +31,15 @@ class AuxlossTestContainer(MoEModelTestContainer):
         torch.distributed.barrier()
         ans = self.partition_input(baseline_grad)
         assert torch.allclose(aux_loss_grad, ans), f"Diff: {(aux_loss_grad/ans).mean()}"
-        loss = parallel_state.get_moe_layer_wise_logging_tracker()['load_balancing_loss']
+        loss = get_moe_layer_wise_logging_tracker()['load_balancing_loss']['values']
+        assert loss > 0, "Loss should be greater than 0"
         clear_aux_losses_tracker()
+
+        with torch.no_grad():
+            probs, indices = moe_layer.router(partitioned_input)
+            loss = get_moe_layer_wise_logging_tracker()['load_balancing_loss']['values']
+            assert loss == 0, "Loss should be 0"
+            clear_aux_losses_tracker()
 
 
 class TestAuxLoss:
@@ -59,7 +69,6 @@ class TestAuxLoss:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.internal
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
@@ -79,7 +88,6 @@ class TestAuxLoss:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.internal
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
@@ -125,8 +133,9 @@ class TestSeqAuxLoss:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.internal
-    @pytest.mark.parametrize("tp_size,ep_size,cp_size", [(1, 8, 1)])
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
+    )
     def test_a2a_dispatcher(self, tp_size, ep_size, cp_size):
         container = AuxlossTestContainer(
             tp_size=tp_size,

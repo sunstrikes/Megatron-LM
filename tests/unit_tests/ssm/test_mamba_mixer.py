@@ -6,7 +6,7 @@ import torch
 from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -44,6 +44,7 @@ class TestMambaMixer:
         hidden_states = torch.ones((sequence_length, micro_batch_size, mixer.config.hidden_size))
         hidden_states = hidden_states.cuda()
         output, bias = mixer(hidden_states)
+        assert mixer.config.mamba_num_heads == None
         assert output.shape[0] == sequence_length
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == mixer.config.hidden_size
