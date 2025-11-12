@@ -89,6 +89,7 @@ def add_text_generation_args(parser):
             "MotionBench",
             "PhysGameBench",
             "MVBench",
+            "inference",
         ],
         help="Generation task to run",
     )
@@ -201,7 +202,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
         inference_engine = StaticInferenceEngine(
-            controller, max_batch_size=1, random_seed=args.seed
+            controller, max_batch_size=1, random_seed=args.seed, legacy=True
         )
         sampling_params = SamplingParams(
             temperature=config.temperature,
@@ -278,6 +279,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     "MVBench",
                     "InfoVQA",
                     "SPDocVQA",
+                    "inference",
                 ):
                     output_name = "answer"
                 elif config.task in ("MMMU"):
@@ -316,6 +318,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     "MVBench",
                     "InfoVQA",
                     "SPDocVQA",
+                    "inference",
                 ):
                     if isinstance(answers, str):
                         answers = [answers]
@@ -359,8 +362,12 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             idx += 1
 
 
-def get_evaluation_configs() -> Dict[str, EvaluationConfig]:
+def get_evaluation_configs(config_path=None) -> Dict[str, EvaluationConfig]:
     """Get evaluation config(s) from a config file or command-line arguments.
+
+    Args:
+        config_path: Optional path to config file. If not provided, will check args.config_path
+                    or fall back to command-line arguments.
 
     Returns:
         Dict[str, EvaluationConfig]: dict of configs.
@@ -368,22 +375,12 @@ def get_evaluation_configs() -> Dict[str, EvaluationConfig]:
     args = get_args()
     configs = {}
 
-    if args.config_path:
-        with open(args.config_path, "r") as f:
-            config_data = yaml.safe_load(f)
-        if 'datasets' not in config_data:
-            print("Error: 'datasets' key not found in config file for batch mode.")
-            sys.exit(1)
-        config_dict = config_data['datasets']
-        for key, value in config_dict.items():
-            config = EvaluationConfig(**value)
-            config.dataset = key
-            if not config.output_path:
-                os.makedirs(args.output_path, exist_ok=True)
-                config.output_path = os.path.join(args.output_path, f"{args.language_model_type}")
-            configs[key] = config
-        return configs
-    else:
+    # Use provided config_path or fall back to args.config_path
+    config_file = config_path or args.config_path
+
+    # We check if we're trying to run a single config evals by checking for the task and output_path
+    # args.
+    if hasattr(args, "task") and args.task and hasattr(args, "output_path") and args.output_path:
         # Single config from args
         config = EvaluationConfig(
             task=args.task,
@@ -403,6 +400,25 @@ def get_evaluation_configs() -> Dict[str, EvaluationConfig]:
             os.makedirs(default_output_dir, exist_ok=True)
             config.output_path = os.path.join(default_output_dir, args.language_model_type)
         return {args.task: config}
+    elif config_file:
+        with open(config_file, "r") as f:
+            config_data = yaml.safe_load(f)
+        if 'datasets' not in config_data:
+            print("Error: 'datasets' key not found in config file for batch mode.")
+            sys.exit(1)
+        config_dict = config_data['datasets']
+        for key, value in config_dict.items():
+            config = EvaluationConfig(**value)
+            config.dataset = key
+            if not config.output_path:
+                # Use args.output_path if available, otherwise use "generated"
+                default_output_dir = getattr(args, 'output_path', None) or "generated"
+                os.makedirs(default_output_dir, exist_ok=True)
+                config.output_path = os.path.join(default_output_dir, f"{args.language_model_type}")
+            configs[key] = config
+        return configs
+    else:
+        raise ValueError("No config file provided and no task specified.")
 
 
 def get_output_path(config, dp_rank):
@@ -460,15 +476,8 @@ class VLMForwardStep(ForwardStep):
         self._num_img_embeddings = num_img_embeddings
         self.decoder_seq_length = decoder_seq_length
 
-        self._recv_only_vision_embeds = False
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        # Checks if the previous stage only has a vision encoder, and that the current stage has part of the LM decoder.
-        # In this case, the current stage should only receive vision embeddings.
-        if pp_rank > 0:
-            self._recv_only_vision_embeds = parallel_state.is_inside_encoder(pp_rank - 1) and (not parallel_state.is_inside_decoder(pp_rank - 1)) and parallel_state.is_inside_decoder()
-
-        # Checks if the current stage only has a vision encoder
-        self._encoder_only = parallel_state.is_inside_encoder() and not parallel_state.is_inside_decoder()
+        self._recv_only_vision_embeds = False  # TODO: Implement new logic for vision embeddings
+        self._encoder_only = False  # TODO: Implement new logic for encoder-only stages
 
     def _forward(self, tokens, position_ids, attention_mask):
         return self.model(
@@ -624,8 +633,14 @@ def get_conversation(task, question, metadata=None):
             {"role": "system", "content": "Answer the questions."},
             {"role": "user", "content": f"{IMAGE_TOKEN}\n{question}"},
         ]
+    elif task == "inference":
+        conversation = [
+            {"role": "system", "content": "Answer the questions."},
+            {"role": "user", "content": f"{question}"},
+        ]
     else:
         raise NotImplementedError(f"No prompting support for task {task}")
+
 
     return conversation
 
@@ -776,11 +791,53 @@ def run_eval(config, iteration=None):
         score = {f"MVBench accuracy": avg_acc_dict['total-acc']}
         with open(config.output_path + "-scores.txt", "a") as f:
             f.write(f"{config.task} {config.dataset} scores at iteration={iteration}: {avg_acc_dict}\n")
+    elif config.task == "inference":
+        score = {"Inference accuracy:": None}
+        pass
     else:
-        raise NotImplementedError(f"online evaluation of {config.task} not implemented yet")
+        raise NotImplementedError(f"Evaluation of {config.task} not implemented yet")
 
     print(score)
     return score
+
+
+def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None, print_output=True):
+    """
+    Common evaluation loop used by both online evaluation during training and standalone evaluation.
+
+    Args:
+        model: The model to evaluate
+        configs: Dict[str, EvaluationConfig] - dictionary of evaluation configs
+        output_dir_override: Optional directory to override the output path in configs
+        iteration: Optional iteration number for logging
+        print_output: Whether to print generation output
+
+    Returns:
+        Dict[str, float]: Dictionary of evaluation scores
+    """
+    args = get_args()
+    scores = {}
+
+    for key, config in configs.items():
+        # Handle output path override for online evaluation
+        if output_dir_override:
+            config.output_path = os.path.join(output_dir_override, args.language_model_type)
+
+        # Generate samples and write to file
+        generate_and_write_samples(model, config, print_output=print_output)
+
+        # Synchronize before evaluation
+        torch.distributed.barrier()
+
+        # Run evaluation on the last rank
+        if is_last_rank():
+            task_scores = run_eval(config, iteration=iteration)
+            scores.update(task_scores)
+
+        # Synchronize after evaluation
+        torch.distributed.barrier()
+
+    return scores
 
 
 def eval_tasks():
@@ -794,7 +851,7 @@ def eval_tasks():
                               parallel_output=False)
 
     # Set up model and load checkpoint.
-    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_and_decoder, wrap_with_ddp=False)
+    model = get_model(wrapped_model_provider, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=False)
 
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
@@ -804,18 +861,8 @@ def eval_tasks():
 
     configs = get_evaluation_configs()
 
-    for task, config in configs.items():
-        print(f"Running eval task {task}")
-        generate_and_write_samples(model, config)
-
-        # Make sure the first rank is done writing so that the last rank can run eval.
-        torch.distributed.barrier()
-
-        if is_last_rank():
-            # Run evaluation.
-            score = run_eval(config, args.ckpt_step)
-
-        torch.distributed.barrier()
+    # Use the common evaluation loop
+    run_evaluation_loop(model, configs, iteration=args.ckpt_step)
 
 
 if __name__ == "__main__":

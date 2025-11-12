@@ -1,3 +1,5 @@
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import json
 import logging
 import os
@@ -17,7 +19,7 @@ import yaml
 from jetclient.facades.objects import log as jet_log
 from jetclient.services.dtos.pipeline import PipelineStatus
 
-from tests.test_utils.python_scripts import common
+from tests.test_utils.python_scripts import recipe_parser
 
 BASE_PATH = pathlib.Path(__file__).parent.resolve()
 DASHBOARD_ENDPOINT = os.getenv("DASHBOARD_ENDPOINT")
@@ -60,27 +62,30 @@ def launch_and_wait_for_completion(
 ) -> jetclient.JETPipeline:
     cluster_config = {"account": account}
     if partition is not None:
-        cluster_config['partition'] = partition
+        cluster_config["partition"] = partition
 
     n_submission_attempts = 0
     while n_submission_attempts < 3:
         try:
             pipeline = jetclient.JETClient(
-                customer='mcore', gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
+                customer="mcore", gitlab_ci_token=os.getenv("RO_API_TOKEN"), env="prod"
             ).workloads.submit(
-                workloads=common.load_workloads(
-                    test_case=test_case,
-                    n_repeat=n_repeat,
-                    time_limit=(1200 if enable_lightweight_mode else time_limit),
-                    tag=tag,
-                    scope=scope,
-                    container_image=container_image,
-                    container_tag=container_tag,
-                    platform=platform,
-                    environment=environment,
-                    record_checkpoints=record_checkpoints,
-                ),
-                config_id=f"mcore/{common.resolve_cluster_config(cluster)}",
+                workloads=[
+                    jetclient.JETWorkloadManifest(**workload)
+                    for workload in recipe_parser.load_workloads(
+                        test_case=test_case,
+                        n_repeat=n_repeat,
+                        time_limit=(1200 if enable_lightweight_mode else time_limit),
+                        tag=tag,
+                        scope=scope,
+                        container_image=container_image,
+                        container_tag=container_tag,
+                        platform=platform,
+                        environment=environment,
+                        record_checkpoints=record_checkpoints,
+                    )
+                ],
+                config_id=f"mcore/{recipe_parser.resolve_cluster_config(cluster)}",
                 custom_config={
                     "launchers": {cluster: cluster_config},
                     "executors": {
@@ -103,6 +108,9 @@ def launch_and_wait_for_completion(
                                         "MCORE_BACKWARDS_COMMIT": (
                                             os.getenv("MCORE_BACKWARDS_COMMIT") or ""
                                         ),
+                                        "HF_HUB_CACHE": "/lustre/fsw/coreai_dlalgo_mcore/hf_hub",
+                                        "TRANSFORMERS_OFFLINE": "1",
+                                        "CLUSTER": cluster,
                                     }
                                 }
                             }
@@ -110,13 +118,16 @@ def launch_and_wait_for_completion(
                     },
                     "outputs": {
                         "enabled": True,
-                        "artifacts_storages": [common.resolve_artifact_config(cluster)],
+                        "artifacts_storages": [recipe_parser.resolve_artifact_config(cluster)],
                     },
                 },
                 wait_for_validation=True,
                 max_wait_time=(60 * 60),
             )
-        except jetclient.clients.gitlab.GitlabAPIError as e:
+        except (
+            jetclient.clients.gitlab.GitlabAPIError,
+            jetclient.facades.objects.util.WaitTimeExceeded,
+        ) as e:
             logger.error(f"Faced {str(e)}. Waiting and retrying...")
             n_submission_attempts += 1
             time.sleep(2**n_submission_attempts * 5)
@@ -199,7 +210,6 @@ def extract_main_log_to_string(logs_path: pathlib.Path) -> List[str]:
         for stdout_file in restart_dir.glob(
             "assets/basic/*/jet_assets/output_logs/output_script-0.log"
         ):
-
             # Read log file
             try:
                 with open(stdout_file) as f:
@@ -219,14 +229,6 @@ def parse_failed_job(logs: List[str]) -> Optional[bool]:
     return False
 
 
-def parse_finished_training(logs: List[str]) -> Optional[bool]:
-    for log_row in logs[::-1]:
-        match = re.search(r"after training is done", log_row)
-        if match is not None:
-            return True
-    return False
-
-
 def telemetrics_and_exit(
     success: bool, test_case: str, environment: str, pipeline_id: int, is_integration_test: bool
 ):
@@ -239,8 +241,8 @@ def telemetrics_and_exit(
                 "environment": environment,
                 "is_integration_test": is_integration_test,
                 "duration_seconds": (
-                    pd.Timestamp.now(tz='UTC')
-                    - pd.Timestamp(os.getenv("CI_JOB_STARTED_AT"), tz='UTC')
+                    pd.Timestamp.now(tz="UTC")
+                    - pd.Timestamp(os.getenv("CI_JOB_STARTED_AT"), tz="UTC")
                 ).total_seconds(),
                 "is_merge_request": os.getenv("CI_MERGE_REQUEST_IID") is not None,
                 "ci_merge_request_iid": os.getenv("CI_MERGE_REQUEST_IID"),
@@ -256,7 +258,7 @@ def telemetrics_and_exit(
     res = requests.post(
         DASHBOARD_ENDPOINT,
         data=payload,
-        headers={'Content-Type': 'application/json', 'Accept-Charset': 'UTF-8'},
+        headers={"Content-Type": "application/json", "Accept-Charset": "UTF-8"},
     )
 
     if not res.ok:
@@ -266,11 +268,38 @@ def telemetrics_and_exit(
     sys.exit(int(not success))
 
 
+def is_flaky_failure(concat_allranks_logs: str) -> bool:
+    return (
+        "The server socket has failed to listen on any local network address."
+        in concat_allranks_logs
+        or "Some NCCL operations have failed or timed out." in concat_allranks_logs
+        or "uncorrectable ECC error encountered" in concat_allranks_logs
+        or "illegal memory access" in concat_allranks_logs
+        or "illegal instruction" in concat_allranks_logs
+        or "torch.distributed.DistNetworkError" in concat_allranks_logs
+        or "Segmentation fault" in concat_allranks_logs
+        or "found NaN in" in concat_allranks_logs
+        or "For debugging consider passing CUDA_LAUNCH_BLOCKING=1" in concat_allranks_logs
+        or "double free or corruption" in concat_allranks_logs
+        or "Call to CUDA function failed." in concat_allranks_logs
+        or "Connection reset by peer" in concat_allranks_logs
+        or "invalid pointer" in concat_allranks_logs
+        or "malloc(): unaligned tcache chunk detected" in concat_allranks_logs
+        or "zmq.error.ZMQError: Address already in use" in concat_allranks_logs
+        or "We couldn't connect to 'https://huggingface.co'" in concat_allranks_logs
+        or "Unpack failed: incomplete input" in concat_allranks_logs
+        or "unspecified launch failure" in concat_allranks_logs
+        or "free(): corrupted unsorted chunks" in concat_allranks_logs
+        or "Segfault encountered" in concat_allranks_logs
+        or "Fatal glibc error" in concat_allranks_logs
+    )
+
+
 @click.command()
 @click.option("--model", required=True, type=str, help="Model")
 @click.option("--test-case", required=True, type=str, help="Test case")
 @click.option(
-    "--environment", required=True, type=click.Choice(['dev', 'lts']), help="Pytorch LTS or DEV"
+    "--environment", required=True, type=click.Choice(["dev", "lts"]), help="Pytorch LTS or DEV"
 )
 @click.option("--n-repeat", required=False, default=1, type=int)
 @click.option("--time-limit", required=False, default=1800, type=int)
@@ -327,7 +356,7 @@ def main(
     enable_lightweight_mode: bool = False,
 ):
     logging.basicConfig(level=logging.INFO)
-    logger.info('Started')
+    logger.info("Started")
 
     model_config_path = pathlib.Path(
         BASE_PATH
@@ -347,11 +376,11 @@ def main(
             except yaml.YAMLError as exc:
                 print(exc)
 
-        test_type = test_case_dict['TEST_TYPE']
+        test_type = test_case_dict["TEST_TYPE"]
     else:
         test_type = "unit_test"
 
-    logger.info('test_type will be %s', test_type)
+    logger.info("test_type will be %s", test_type)
 
     if test_type == "release" and (run_name is None or wandb_experiment is None):
         logger.error(f"Not all arguments provided ({run_name=}, {wandb_experiment=})")
@@ -360,7 +389,7 @@ def main(
     n_attempts = 0
     n_nondeterminism_attemps = 0
     n_iteration = 0
-    while True and n_attempts < 3 and n_nondeterminism_attemps < 2:
+    while True and n_attempts < 9 and n_nondeterminism_attemps < 3:
         pipeline = launch_and_wait_for_completion(
             test_case=test_case,
             environment=environment,
@@ -387,6 +416,7 @@ def main(
                 jet_log = main_job.get_logs()
                 assets_base_path = download_job_assets(logs=jet_log, iteration=n_iteration)
                 if assets_base_path is None:
+                    no_log = True
                     break
                 allranks_logs = extract_torchrunlogs_to_string(logs_path=assets_base_path)
                 mainrank_log = extract_main_log_to_string(logs_path=assets_base_path)
@@ -402,10 +432,13 @@ def main(
                 time.sleep(2 * n_download_attempt * 15)
                 n_download_attempt += 1
                 no_log = True
-            except (KeyError, IndexError) as e:
+            except Exception as e:
                 logger.error(e)
                 no_log = True
+                n_download_attempt += 1
                 break
+
+            n_download_attempt += 1
 
         if no_log:
             logger.error("Did not find any logs to download, retry.")
@@ -442,11 +475,8 @@ def main(
         logger.info("Pipeline terminated with status %s", status.name)
 
         if test_type == "unit_test":
-            if (
-                "The server socket has failed to listen on any local network address."
-                in concat_allranks_logs
-            ):
-                logger.error("TCP error, attempt restart.")
+            if not success and is_flaky_failure(concat_allranks_logs):
+                logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
 
@@ -462,23 +492,18 @@ def main(
                     is_integration_test=enable_lightweight_mode,
                 )
 
-            if (
-                "The server socket has failed to listen on any local network address."
-                in concat_allranks_logs
-                or "Some NCCL operations have failed or timed out." in concat_allranks_logs
-                or "uncorrectable ECC error encountered" in concat_allranks_logs
-                or "illegal memory access" in concat_allranks_logs
-                or "illegal instruction" in concat_allranks_logs
-                or "torch.distributed.DistNetworkError" in concat_allranks_logs
-                or "Segmentation fault" in concat_allranks_logs
-            ):
-                logger.error("Detected NCCL failure, attempt restart.")
+            if is_flaky_failure(concat_allranks_logs):
+                if n_attempts < 9:
+                    logger.error("Detected flaky failure, attempt restart.")
                 n_attempts += 1
                 continue
 
-            if "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log:
-                logger.error("Non-determinism, let's try another node.")
+            if (
+                "FAILED tests/functional_tests/python_test_utils" in concat_mainrank_log
+            ) and re.compile(r"\bEXIT_CODE=0\b").search(concat_mainrank_log) is not None:
                 n_nondeterminism_attemps += 1
+                if n_nondeterminism_attemps < 3:
+                    logger.error("Non-determinism, let's try another node.")
                 continue
 
             telemetrics_and_exit(
@@ -489,13 +514,20 @@ def main(
                 is_integration_test=enable_lightweight_mode,
             )
 
-        if parse_failed_job(logs=mainrank_log):
-            n_attempts += 1
-            continue
+        if test_type == "release":
+            if (
+                "StopIteration" in concat_allranks_logs
+                or "after training is done" in concat_allranks_logs
+                or "exiting program at iteration" in concat_allranks_logs
+            ):
+                logger.info("Release training finished")
+                sys.exit(int(not success))  # invert for exit 0
 
-        if parse_finished_training(logs=mainrank_log):
-            sys.exit(int(not success))  # invert for exit 0
-        n_iteration += 1
+            if parse_failed_job(logs=mainrank_log):
+                n_attempts += 1
+                continue
+
+            n_iteration += 1
 
     telemetrics_and_exit(
         success=False,
