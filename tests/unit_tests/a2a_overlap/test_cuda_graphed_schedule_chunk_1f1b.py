@@ -18,27 +18,22 @@ from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_ma
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version, unwrap_model
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     set_args,
     set_global_variables,
 )
 from megatron.training.training import setup_model_and_optimizer
+from tests.unit_tests.a2a_overlap.utils import (
+    get_valid_flex_dispatcher_backend,
+    get_valid_token_dispatcher_types,
+)
 from tests.unit_tests.test_utilities import Utils
-
-
-def is_deep_ep_available():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP
-
-    return HAVE_DEEP_EP
-
-
-def is_hybrid_ep_available():
-    from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
-
-    return HAVE_HYBRIDEP
 
 
 def save(fn, message):
@@ -89,6 +84,7 @@ class TestPartialCudaGraphedA2AOverlap:
     ):
         model_parallel_cuda_manual_seed(123)
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             config,
@@ -105,7 +101,7 @@ class TestPartialCudaGraphedA2AOverlap:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.tokenizer.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -127,7 +123,6 @@ class TestPartialCudaGraphedA2AOverlap:
         args = parse_args()
         args.num_layers = 1
         args.mtp_num_layers = None
-        args.vocab_size = 1024
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
@@ -172,7 +167,9 @@ class TestPartialCudaGraphedA2AOverlap:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer = TokenizerConfig(vocab_size=1024)
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):
@@ -274,7 +271,7 @@ class TestPartialCudaGraphedA2AOverlap:
         )
 
         gpt_model, optimizer, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            ModelType.encoder_or_decoder, self.model_provider
         )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
@@ -339,22 +336,12 @@ class TestPartialCudaGraphedA2AOverlap:
         not (HAVE_TE and is_te_min_version("2.10.0")),
         reason="Partial CUDA graph support requires TransformerEngine version >= 2.10.0",
     )
-    @pytest.mark.parametrize("moe_dispatcher_type", ["alltoall", "deepep"])
+    @pytest.mark.parametrize("moe_dispatcher_type", get_valid_token_dispatcher_types())
     def test_moe_partial_cudagraph_with_ep_overlap(self, moe_dispatcher_type):
         extra_kwargs = {"moe_layer_freq": 1}
-        if moe_dispatcher_type == "deepep":
-            if not is_deep_ep_available():
-                pytest.skip("Deep EP is not available")
-            extra_kwargs["moe_token_dispatcher_type"] = "flex"
-            extra_kwargs["moe_flex_dispatcher_backend"] = "deepep"
-            extra_kwargs["moe_router_dtype"] = "fp32"
-        elif moe_dispatcher_type == "hybridep":
-            if not is_hybrid_ep_available():
-                pytest.skip("Hybrid EP is not available")
-            extra_kwargs["moe_token_dispatcher_type"] = "flex"
-            extra_kwargs["moe_flex_dispatcher_backend"] = "hybridep"
-        else:
-            extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
+        extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
+        if moe_dispatcher_type == "flex":
+            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
 
         loss_list_ref = self._run_test_helper(4, "none", None, 3, **extra_kwargs)
         for cuda_graph_modules in [

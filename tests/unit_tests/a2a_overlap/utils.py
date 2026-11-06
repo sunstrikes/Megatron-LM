@@ -82,6 +82,8 @@ def deterministic_mode():
         "NCCL_NVLS_ENABLE": "0",
         "NVTE_FUSED_ATTN": "0",
         "NCCL_ALGO": "^NVLS",
+        # Preserve expert token order before NCCL EP creates its process-wide group.
+        "NCCL_EP_HT_EM_AG_SCAN_MODE": "1",
         "NVTE_FWD_LAYERNORM_SM_MARGIN": "8",
         "NVTE_BWD_LAYERNORM_SM_MARGIN": "8",
     }
@@ -240,6 +242,49 @@ def get_valid_flex_dispatcher_backend():
         return "deepep"
     else:
         return None
+
+
+def get_valid_flex_dispatcher_backends():
+    """Flex backends to sweep in the overlap tests.
+
+    Returns the primary available backend (hybridep preferred, else deepep) plus ``ncclep`` when
+    its TransformerEngine NCCL EP build is present, so each overlap test exercises ncclep alongside
+    the existing reference backend.
+    """
+    from tests.unit_tests.test_utilities import is_nccl_ep_available
+
+    backends = []
+    primary = get_valid_flex_dispatcher_backend()
+    if primary is not None:
+        backends.append(primary)
+    if is_nccl_ep_available() and "ncclep" not in backends:
+        backends.append("ncclep")
+    return backends
+
+
+def get_valid_dispatcher_configs():
+    """(moe_token_dispatcher_type, flex_backend) pairs to parametrize the overlap tests across.
+
+    Always includes ``("alltoall", None)``; adds one ``("flex", backend)`` entry per available
+    flex backend (see get_valid_flex_dispatcher_backends).
+    """
+    configs = [("alltoall", None)]
+    for backend in get_valid_flex_dispatcher_backends():
+        configs.append(("flex", backend))
+    return configs
+
+
+def apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend):
+    """Wire the dispatcher type + flex backend into a config kwargs dict.
+
+    ncclep is left in eager mode (no moe_expert_rank_capacity_factor): the static path needs the
+    fused grouped GEMM, which these overlap tests do not enable. Tests that do (zero-copy) set the
+    capacity factor themselves.
+    """
+    extra_kwargs["moe_token_dispatcher_type"] = dispatcher_type
+    if dispatcher_type == "flex":
+        extra_kwargs["moe_flex_dispatcher_backend"] = flex_backend
+    return extra_kwargs
 
 
 def build_gpt_model(config, vocab_size=512, max_seq_len=300):

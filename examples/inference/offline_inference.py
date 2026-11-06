@@ -43,7 +43,6 @@ from examples.inference.utils import (
 )
 from megatron.core.inference.apis import MegatronAsyncLLM, MegatronLLM
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
     add_inference_args,
@@ -52,6 +51,8 @@ from megatron.inference.utils import (
 )
 from megatron.training import initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import get_tokenizer, set_run_config
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def add_offline_inference_args(parser: ArgumentParser) -> ArgumentParser:
@@ -104,9 +105,21 @@ def _validate_prompt_lengths(args, llm, requests):
 
 
 def _capture_engine_stats(llm) -> dict:
+    """Capture run-level engine counters for reporting.
+
+    Args:
+        llm: High-level inference object that owns the dynamic engine.
+
+    Returns:
+        dict: Engine counters and capture stats used by result reporting.
+    """
     return {
         "step_count": llm.engine.context.step_count,
         "lifetime_prefill_token_count": llm.engine.context.lifetime_prefill_token_count,
+        "async_sched_step_count": llm.engine.context.async_sched_step_count,
+        "async_sched_compaction_step_count": (
+            llm.engine.context.async_sched_compaction_step_count
+        ),
         "capture_stats": llm.engine.capture_stats,
     }
 
@@ -132,6 +145,8 @@ def _report_results(
         peak_mem_stats,
         captured["step_count"],
         captured["lifetime_prefill_token_count"],
+        captured["async_sched_step_count"],
+        captured["async_sched_compaction_step_count"],
     )
 
     stats = torch.cuda.memory_stats()
@@ -158,7 +173,13 @@ def _run_sync(args, model, tokenizer, inference_config, requests, prompts_list, 
     results = []
     throughputs = []
     total_time = 0.0
-    captured = {"step_count": 0, "lifetime_prefill_token_count": 0, "capture_stats": None}
+    captured = {
+        "step_count": 0,
+        "lifetime_prefill_token_count": 0,
+        "async_sched_step_count": 0,
+        "async_sched_compaction_step_count": 0,
+        "capture_stats": None,
+    }
     setup_prefix = ""
 
     with MegatronLLM(
@@ -202,7 +223,13 @@ async def _run_async(
     results = []
     throughputs = []
     total_time = 0.0
-    captured = {"step_count": 0, "lifetime_prefill_token_count": 0, "capture_stats": None}
+    captured = {
+        "step_count": 0,
+        "lifetime_prefill_token_count": 0,
+        "async_sched_step_count": 0,
+        "async_sched_compaction_step_count": 0,
+        "capture_stats": None,
+    }
     setup_prefix = ""
 
     async with MegatronAsyncLLM(
@@ -241,6 +268,7 @@ def main():
         extra_args_provider=add_offline_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
     initialize_megatron()
     _validate_high_level_api_args(args)
 
@@ -251,7 +279,7 @@ def main():
     logging.basicConfig(level=level, force=True)
     configure_nvtx_profiling(True)
 
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
     torch.cuda.reset_peak_memory_stats()
 
     sampling_params = SamplingParams(
